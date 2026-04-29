@@ -32,12 +32,34 @@
 // `["1","0"]`/`["0","1"]`). Поэтому если slug-запрос показал событие как
 // неразрешённое, а его окно уже закончилось, мы добираем актуальные данные
 // из series-листинга и используем их.
+//
+// Ещё один уровень устаревания (issue #13): для самого свежего из
+// «прошедших» событий (то, что закончилось буквально 0–2 минуты назад)
+// и slug-запрос, и series-листинг ещё не отдают финальные данные —
+// listing просто не содержит этот slug, а per-slug по-прежнему `closed=false`
+// с промежуточными ценами. UI Polymarket в этот момент уже показывает итог,
+// а CLOB API (`https://clob.polymarket.com/last-trade-price?token_id=...`)
+// отдаёт «снэпом» цены последних сделок: ~0.99 у победителя и ~0.01 у
+// проигравшего. После закрытия окна торговля по этим токенам по сути
+// прекращается (выигрышная сторона стремится к 1, проигравшая к 0),
+// поэтому `last-trade-price` — самый надёжный источник для добора резолюции.
+// Используем это как третий fallback: только для событий, чьё окно уже
+// закончилось (`endDate < now`), и только если две стороны разошлись
+// явно — победитель ≥ RESOLVE_HIGH_THRESHOLD и проигравший
+// ≤ RESOLVE_LOW_THRESHOLD. Иначе оставляем `result=null`.
 
 const SERIES_PREFIX = "btc-updown-5m";
 const SERIES_SLUG = "btc-up-or-down-5m";
 const STEP_SECONDS = 300; // 5 минут
 
 const GAMMA_HOST = process.env.GAMMA_HOST || "https://gamma-api.polymarket.com";
+const CLOB_HOST = process.env.CLOB_HOST || "https://clob.polymarket.com";
+
+// Пороги для CLOB-fallback'а. После закрытия 5-минутного окна цены на
+// победившей и проигравшей стороне разъезжаются практически в 1.0/0.0;
+// 0.95/0.05 даёт большой запас от любых внутрь-окновых колебаний.
+const RESOLVE_HIGH_THRESHOLD = 0.95;
+const RESOLVE_LOW_THRESHOLD = 0.05;
 
 export type UpDown = "UP" | "DOWN";
 
@@ -47,6 +69,16 @@ export interface PastEvent {
   startTime: string;      // ISO eventStartTime, для удобства
   resolved: boolean;
   result: UpDown | null;  // null, если ещё не разрешён
+}
+
+// Внутреннее представление события, обогащённое данными для CLOB-fallback'а.
+// `endDate` нужен, чтобы триггерить fallback только после закрытия окна;
+// `clobTokenIds`/`outcomes` — чтобы запросить `last-trade-price` правильной
+// стороны и понять, кто выиграл.
+interface RawEvent extends PastEvent {
+  endDate: number | null;          // unix seconds, null если не пришёл
+  clobTokenIds: [string, string] | null;
+  outcomes: [string, string] | null;
 }
 
 /** Парсит слаг вида `btc-updown-5m-1777398300` и возвращает unix-секунды. */
@@ -69,17 +101,20 @@ export function buildSlug(timestamp: number): string {
 
 /**
  * Превращает один Gamma-event (как из `?slug=...`, так и из `?series_slug=...`)
- * в наш `PastEvent`. Логика разрешения:
+ * в наш `RawEvent`. Логика разрешения:
  *   closed=true И outcomePrices ровно ["1","0"] / ["0","1"] (см. issue #9).
  * До разрешения цены живые (например 0.955 / 0.045) — такие события возвращаем
  * как result=null.
+ *
+ * Дополнительно подтягиваем `endDate` и `clobTokenIds` для CLOB-fallback'а
+ * (см. issue #13).
  */
-function toPastEvent(event: any): PastEvent {
+function toRawEvent(event: any): RawEvent {
   const market = event?.markets?.[0];
   if (!market) {
     throw new Error(`Event "${event?.slug}" has no markets`);
   }
-  // outcomes / outcomePrices приходят как JSON-строки внутри JSON.
+  // outcomes / outcomePrices / clobTokenIds приходят как JSON-строки.
   const outcomes: string[] = JSON.parse(market.outcomes);
   const prices: string[] = JSON.parse(market.outcomePrices);
 
@@ -97,16 +132,40 @@ function toPastEvent(event: any): PastEvent {
     else throw new Error(`Unexpected winning outcome "${winner}" for slug "${event.slug}"`);
   }
 
+  let clobTokenIds: [string, string] | null = null;
+  if (typeof market.clobTokenIds === "string") {
+    const parsed = JSON.parse(market.clobTokenIds);
+    if (Array.isArray(parsed) && parsed.length === 2) {
+      clobTokenIds = [String(parsed[0]), String(parsed[1])];
+    }
+  }
+
+  const endDateRaw = event.endDate ?? market.endDate;
+  const endDate = endDateRaw ? Math.floor(new Date(endDateRaw).getTime() / 1000) : null;
+
   return {
     slug: event.slug,
     startTimestamp: parseSlugTimestamp(event.slug),
     startTime: market.eventStartTime ?? event.startDate,
     resolved,
     result,
+    endDate,
+    clobTokenIds,
+    outcomes: outcomes.length === 2 ? [outcomes[0], outcomes[1]] : null,
   };
 }
 
-async function fetchEventBySlug(slug: string): Promise<PastEvent> {
+function toPastEvent(raw: RawEvent): PastEvent {
+  return {
+    slug: raw.slug,
+    startTimestamp: raw.startTimestamp,
+    startTime: raw.startTime,
+    resolved: raw.resolved,
+    result: raw.result,
+  };
+}
+
+async function fetchEventBySlug(slug: string): Promise<RawEvent> {
   const url = `${GAMMA_HOST}/events?slug=${encodeURIComponent(slug)}`;
   const res = await fetch(url);
   if (!res.ok) {
@@ -116,7 +175,7 @@ async function fetchEventBySlug(slug: string): Promise<PastEvent> {
   if (!Array.isArray(arr) || arr.length === 0) {
     throw new Error(`Event not found for slug "${slug}"`);
   }
-  return toPastEvent(arr[0]);
+  return toRawEvent(arr[0]);
 }
 
 /**
@@ -127,7 +186,7 @@ async function fetchEventBySlug(slug: string): Promise<PastEvent> {
  * slug-запрос ещё несколько минут возвращает промежуточные котировки и
  * `closed=false`. Используем как fallback для добора недостающих результатов.
  */
-async function fetchRecentResolvedEvents(limit: number): Promise<PastEvent[]> {
+async function fetchRecentResolvedEvents(limit: number): Promise<RawEvent[]> {
   const url =
     `${GAMMA_HOST}/events?series_slug=${encodeURIComponent(SERIES_SLUG)}` +
     `&closed=true&order=startDate&ascending=false&limit=${limit}`;
@@ -141,7 +200,63 @@ async function fetchRecentResolvedEvents(limit: number): Promise<PastEvent[]> {
   // префиксу слага, чтобы не споткнуться при разборе timestamp-а.
   return arr
     .filter((e) => typeof e?.slug === "string" && e.slug.startsWith(`${SERIES_PREFIX}-`))
-    .map(toPastEvent);
+    .map(toRawEvent);
+}
+
+/**
+ * CLOB-fallback (issue #13): для события, которое уже завершилось, но Gamma
+ * ещё не отдала финальные данные ни через slug, ни через series-листинг,
+ * берём `last-trade-price` каждой стороны на CLOB. После закрытия окна
+ * победитель торгуется около 1.0, проигравший — около 0.0; промежуточные
+ * значения означают, что окно ещё не закрылось / не отстоялось, и мы
+ * не делаем выводов.
+ *
+ * Возвращает обновлённый PastEvent (с `resolved=true` и нужным `result`),
+ * либо исходное событие, если данных недостаточно. Любая сетевая или
+ * парсерная ошибка приводит к возврату исходного события — fallback
+ * не должен валить общий запрос.
+ */
+async function resolveViaClob(raw: RawEvent, nowSeconds: number): Promise<PastEvent> {
+  if (raw.resolved) return toPastEvent(raw);
+  if (!raw.endDate || raw.endDate > nowSeconds) return toPastEvent(raw);
+  if (!raw.clobTokenIds || !raw.outcomes) return toPastEvent(raw);
+
+  try {
+    const [upTok, downTok] = raw.clobTokenIds;
+    const [pUp, pDown] = await Promise.all([
+      fetchLastTradePrice(upTok),
+      fetchLastTradePrice(downTok),
+    ]);
+    if (pUp === null || pDown === null) return toPastEvent(raw);
+
+    const winnerIdx =
+      pUp >= RESOLVE_HIGH_THRESHOLD && pDown <= RESOLVE_LOW_THRESHOLD
+        ? 0
+        : pDown >= RESOLVE_HIGH_THRESHOLD && pUp <= RESOLVE_LOW_THRESHOLD
+          ? 1
+          : -1;
+    if (winnerIdx === -1) return toPastEvent(raw);
+
+    const winner = raw.outcomes[winnerIdx];
+    let result: UpDown | null = null;
+    if (winner === "Up") result = "UP";
+    else if (winner === "Down") result = "DOWN";
+    if (!result) return toPastEvent(raw);
+
+    return { ...toPastEvent(raw), resolved: true, result };
+  } catch {
+    return toPastEvent(raw);
+  }
+}
+
+async function fetchLastTradePrice(tokenId: string): Promise<number | null> {
+  const url = `${CLOB_HOST}/last-trade-price?token_id=${encodeURIComponent(tokenId)}`;
+  const res = await fetch(url);
+  if (!res.ok) return null;
+  const body = (await res.json()) as { price?: string | number };
+  if (body?.price === undefined || body?.price === null) return null;
+  const n = Number(body.price);
+  return Number.isFinite(n) ? n : null;
 }
 
 /**
@@ -154,28 +269,39 @@ async function fetchRecentResolvedEvents(limit: number): Promise<PastEvent[]> {
  * старому (slug - 1200s). Для каждого события указано, разрешено ли оно
  * (`resolved`) и каков исход (`result`: "UP" | "DOWN" | null, если ещё нет).
  *
- * Параллельно с пер-слаг-запросами тянем listing разрешённых событий серии
- * через `?series_slug=...&closed=true` — он отдаёт свежие данные сразу после
- * закрытия окна, тогда как `?slug=<slug>` залипает в кэше на минуты (issue
- * #11). Если slug-запрос показал событие как ещё не разрешённое, но в
- * series-listing-е оно уже разрешено, берём данные оттуда.
+ * Используем три источника, в порядке убывания «дешевизны»:
+ *   1. `?slug=<slug>` per-event (issue #5).
+ *   2. `?series_slug=...&closed=true` listing — добор для slug'ов, чьи Gamma-
+ *      кэши ещё не обновились (issue #11).
+ *   3. CLOB `/last-trade-price` — добор для самого свежего из «прошедших»
+ *      событий, которое ещё не попало даже в series-листинг (issue #13).
+ *      После закрытия окна цены последних сделок снапятся к 1/0, что и
+ *      даёт исход.
  */
-export async function getPastFiveMinuteEvents(slug: string): Promise<PastEvent[]> {
+export async function getPastFiveMinuteEvents(
+  slug: string,
+  nowMs: number = Date.now(),
+): Promise<PastEvent[]> {
+  const nowSeconds = Math.floor(nowMs / 1000);
   const currentTs = parseSlugTimestamp(slug);
   const slugs = [1, 2, 3, 4].map((i) => buildSlug(currentTs - i * STEP_SECONDS));
   const [perSlug, recentResolved] = await Promise.all([
     Promise.all(slugs.map(fetchEventBySlug)),
-    fetchRecentResolvedEvents(20).catch(() => [] as PastEvent[]),
+    fetchRecentResolvedEvents(20).catch(() => [] as RawEvent[]),
   ]);
-  const resolvedByTs = new Map<number, PastEvent>();
+  const resolvedByTs = new Map<number, RawEvent>();
   for (const e of recentResolved) {
     if (e.resolved) resolvedByTs.set(e.startTimestamp, e);
   }
-  return perSlug.map((e) => {
+  // Шаг 1+2: предпочесть свежие данные из series-листинга, если per-slug
+  // ещё не разрешён.
+  const merged: RawEvent[] = perSlug.map((e) => {
     if (e.resolved) return e;
-    const fresh = resolvedByTs.get(e.startTimestamp);
-    return fresh ?? e;
+    return resolvedByTs.get(e.startTimestamp) ?? e;
   });
+  // Шаг 3: для всё ещё не разрешённых событий, чьё окно уже закончилось,
+  // пробуем CLOB last-trade-price. Параллельно, чтобы не растягивать запрос.
+  return Promise.all(merged.map((e) => resolveViaClob(e, nowSeconds)));
 }
 
 /**
@@ -210,7 +336,7 @@ export function getActiveSlug(nowMs: number = Date.now()): string {
 export async function getPastFiveMinuteEventsFromActive(
   nowMs: number = Date.now(),
 ): Promise<PastEvent[]> {
-  return getPastFiveMinuteEvents(getActiveSlug(nowMs));
+  return getPastFiveMinuteEvents(getActiveSlug(nowMs), nowMs);
 }
 
 if (require.main === module) {
