@@ -21,6 +21,29 @@ const TICK_SIZE = "0.01" as const;
 
 export type Side01 = "YES" | "NO";
 
+let clientPromise: Promise<ClobClient> | null = null;
+
+function getClient(): Promise<ClobClient> {
+  if (!clientPromise) {
+    clientPromise = (async () => {
+      const signer = new Wallet(process.env.PRIVATE_KEY as string);
+      const bootstrap = new ClobClient({ host: CLOB_HOST, chain: CHAIN_ID, signer });
+      const creds = await bootstrap.createOrDeriveApiKey();
+      return new ClobClient({
+        host: CLOB_HOST,
+        chain: CHAIN_ID,
+        signer,
+        creds,
+        signatureType: 0,
+      });
+    })().catch((e) => {
+      clientPromise = null;
+      throw e;
+    });
+  }
+  return clientPromise;
+}
+
 function getActiveSlug(nowMs: number = Date.now()): string {
   const windowStart = Math.floor(nowMs / 1000 / STEP_SECONDS) * STEP_SECONDS;
   return `btc-updown-5m-${windowStart}`;
@@ -63,16 +86,7 @@ export async function buyShare(side: Side01, shares: number) {
   const event = await fetchActiveEvent();
   const tokenID = side === "YES" ? event.yes : event.no;
 
-  const signer = new Wallet(process.env.PRIVATE_KEY as string);
-  const bootstrap = new ClobClient({ host: CLOB_HOST, chain: CHAIN_ID, signer });
-  const creds = await bootstrap.createOrDeriveApiKey();
-  const client = new ClobClient({
-    host: CLOB_HOST,
-    chain: CHAIN_ID,
-    signer,
-    creds,
-    signatureType: 0,
-  });
+  const client = await getClient();
 
   return client.createAndPostOrder(
     {
