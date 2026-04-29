@@ -116,16 +116,50 @@ export async function getPastFiveMinuteEvents(slug: string): Promise<PastEvent[]
   return Promise.all(slugs.map(fetchEventBySlug));
 }
 
+/**
+ * Слаг активного 5-минутного события — то есть того, чьё окно 5 минут
+ * содержит текущий момент. Серия идёт сеткой по `STEP_SECONDS` от unix-эпохи,
+ * поэтому слаг можно вычислить локально, без запроса в Gamma API:
+ *   floor(now / 300) * 300
+ * Это и есть `eventStartTime` (unix-секунды UTC) активного окна, что мы и
+ * используем как суффикс слага.
+ *
+ * Аргумент `nowMs` нужен для тестов / фиксированной точки во времени;
+ * по умолчанию берётся `Date.now()`.
+ */
+export function getActiveSlug(nowMs: number = Date.now()): string {
+  const nowSeconds = Math.floor(nowMs / 1000);
+  const windowStart = Math.floor(nowSeconds / STEP_SECONDS) * STEP_SECONDS;
+  return buildSlug(windowStart);
+}
+
+/**
+ * Возвращает 4 предыдущих 5-минутных события относительно текущего активного.
+ *
+ * Это тонкая обёртка над `getPastFiveMinuteEvents`: вычисляет слаг активного
+ * окна (`getActiveSlug`) и берёт 4 события перед ним. Удобно, когда вызывающей
+ * стороне не нужно самой следить за текущим временем — например, в стратегии,
+ * которая в момент входа в активное окно хочет посмотреть, как разрешились
+ * последние 4 события серии.
+ *
+ * Результат, как и у `getPastFiveMinuteEvents`, упорядочен от самого свежего
+ * (active - 5 мин) к самому старому (active - 20 мин).
+ */
+export async function getPastFiveMinuteEventsFromActive(
+  nowMs: number = Date.now(),
+): Promise<PastEvent[]> {
+  return getPastFiveMinuteEvents(getActiveSlug(nowMs));
+}
+
 if (require.main === module) {
+  // Без аргумента — берём активное (текущее) 5-минутное окно и возвращаем
+  // 4 события до него. С аргументом — поведение как раньше: 4 события до
+  // переданного слага.
   const slug = process.argv[2];
-  if (!slug) {
-    console.error("Usage: ts-node src/events.ts <slug>");
-    console.error("Example: ts-node src/events.ts btc-updown-5m-1777398300");
-    process.exit(1);
-  }
-  getPastFiveMinuteEvents(slug)
-    .then((events) => {
-      console.log(JSON.stringify(events, null, 2));
+  const events = slug ? getPastFiveMinuteEvents(slug) : getPastFiveMinuteEventsFromActive();
+  events
+    .then((evs) => {
+      console.log(JSON.stringify(evs, null, 2));
     })
     .catch((e) => {
       console.error(e);
