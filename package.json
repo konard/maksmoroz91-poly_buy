@@ -1,23 +1,19 @@
 {
   "name": "poly-buy",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Limit-order buy of one side of the active 5-minute Polymarket BTC up/down event",
   "main": "dist/index.js",
   "scripts": {
     "build": "tsc",
-    "start": "ts-node src/index.ts",
     "buy": "ts-node src/buy.ts",
-    "past-events": "ts-node src/events.ts",
-    "test": "ts-node test/buy.test.ts"
+    "past-events": "ts-node src/events.ts"
   },
   "dependencies": {
     "@polymarket/clob-client-v2": "^1.0.2",
     "dotenv": "^16.4.5",
-    "ethers": "^5.8.0",
-    "ws": "^8.18.0"
+    "ethers": "^5.8.0"
   },
   "devDependencies": {
-    "@types/ws": "^8.5.13",
     "ts-node": "^10.9.2",
     "typescript": "^5.6.3"
   }

@@ -52,8 +52,8 @@ const SERIES_PREFIX = "btc-updown-5m";
 const SERIES_SLUG = "btc-up-or-down-5m";
 const STEP_SECONDS = 300; // 5 минут
 
-const GAMMA_HOST = process.env.GAMMA_HOST || "https://gamma-api.polymarket.com";
-const CLOB_HOST = process.env.CLOB_HOST || "https://clob.polymarket.com";
+const GAMMA_HOST = "https://gamma-api.polymarket.com";
+const CLOB_HOST = "https://clob.polymarket.com";
 
 // Пороги для CLOB-fallback'а. После закрытия 5-минутного окна цены на
 // победившей и проигравшей стороне разъезжаются практически в 1.0/0.0;
