@@ -47,6 +47,16 @@
 // закончилось (`endDate < now`), и только если две стороны разошлись
 // явно — победитель ≥ RESOLVE_HIGH_THRESHOLD и проигравший
 // ≤ RESOLVE_LOW_THRESHOLD. Иначе оставляем `result=null`.
+//
+// Сигнал и midpoint активного окна (issue #21): когда 4 предыдущих события
+// разрешились в одну сторону подряд, мы хотим войти в активное окно
+// контртрендом — `DOWN ×4 → BUY YES`, `UP ×4 → BUY NO`. В момент сигнала
+// (т.е. сразу как окно сменилось) полезно знать «по какой цене я
+// теоретически могу купить лимиткой». Берём её из CLOB:
+//   GET https://clob.polymarket.com/midpoint?token_id=<id>
+// возвращает `{"mid":"0.473"}` — ровно середину между лучшим bid и лучшим ask
+// по нужному токену (YES = Up, NO = Down). Это и есть наш «entry midpoint»,
+// который мы пишем в лог рядом с сигналом.
 
 const SERIES_PREFIX = "btc-updown-5m";
 const SERIES_SLUG = "btc-up-or-down-5m";
@@ -339,15 +349,158 @@ export async function getPastFiveMinuteEventsFromActive(
   return getPastFiveMinuteEvents(getActiveSlug(nowMs), nowMs);
 }
 
+export type Side01 = "YES" | "NO";
+
+export interface Signal {
+  // Сторона, в которую разрешились все 4 прошедших окна.
+  trend: UpDown;
+  // Сколько одинаковых исходов подряд — по текущей стратегии всегда 4,
+  // но поле полезно для логов и будущих стратегий с другим окном.
+  count: number;
+  // Сторона, которую покупаем по сигналу. По текущей контр-трендовой
+  // стратегии: DOWN ×4 → YES, UP ×4 → NO.
+  side: Side01;
+}
+
+/**
+ * Считает торговый сигнал по 4 прошедшим 5-минутным событиям.
+ *
+ * Сигнал есть, только если:
+ *   - все события разрешены (`resolved=true`, `result !== null`),
+ *   - у всех одинаковый `result`.
+ *
+ * Стратегия — контртренд: 4 DOWN подряд → BUY YES, 4 UP подряд → BUY NO
+ * (см. issue #21). Если хоть одно событие не разрешено или результаты
+ * смешанные, сигнала нет — возвращаем `null`.
+ */
+export function computeSignal(events: PastEvent[]): Signal | null {
+  if (events.length === 0) return null;
+  const first = events[0].result;
+  if (first === null) return null;
+  for (const e of events) {
+    if (!e.resolved || e.result !== first) return null;
+  }
+  const side: Side01 = first === "DOWN" ? "YES" : "NO";
+  return { trend: first, count: events.length, side };
+}
+
+/**
+ * Активный slug + clobTokenIds (Up/Down) активного 5-минутного события.
+ * Нужно, чтобы спросить у CLOB midpoint правильной стороны (YES = Up,
+ * NO = Down). Используем тот же `?slug=<slug>` Gamma-запрос, что и в `buy.ts`
+ * — у активного окна он не страдает от пост-резолюшен кэша.
+ */
+async function fetchActiveTokenIds(
+  nowMs: number = Date.now(),
+): Promise<{ slug: string; yes: string; no: string }> {
+  const slug = getActiveSlug(nowMs);
+  const url = `${GAMMA_HOST}/events?slug=${encodeURIComponent(slug)}`;
+  const res = await fetch(url);
+  if (!res.ok) {
+    throw new Error(`Gamma API ${res.status} ${res.statusText} for slug "${slug}"`);
+  }
+  const arr = (await res.json()) as any[];
+  const market = arr?.[0]?.markets?.[0];
+  if (!market) {
+    throw new Error(`Active event not found for slug "${slug}"`);
+  }
+  const outcomes: string[] = JSON.parse(market.outcomes);
+  const tokenIds: string[] = JSON.parse(market.clobTokenIds);
+  const upIdx = outcomes.findIndex((o) => o.toLowerCase() === "up");
+  const downIdx = outcomes.findIndex((o) => o.toLowerCase() === "down");
+  if (upIdx === -1 || downIdx === -1) {
+    throw new Error(`Outcomes are not Up/Down: ${JSON.stringify(outcomes)}`);
+  }
+  return { slug, yes: String(tokenIds[upIdx]), no: String(tokenIds[downIdx]) };
+}
+
+/**
+ * Запрашивает midpoint указанного токена у CLOB:
+ *   GET https://clob.polymarket.com/midpoint?token_id=<id>  →  {"mid":"0.473"}
+ *
+ * Это середина между лучшим bid и лучшим ask по токену — оценка цены, по
+ * которой реально получится исполнить небольшой лимит-ордер сразу после
+ * открытия 5-минутного окна. Возвращает число в долях (0..1); умножение на
+ * 100 даёт центы для лога.
+ *
+ * Возвращает `null`, если эндпоинт не отвечает или у токена ещё нет
+ * стакана (например, рынок только-только создан) — fallback решений
+ * наверху.
+ */
+export async function fetchMidpoint(tokenId: string): Promise<number | null> {
+  const url = `${CLOB_HOST}/midpoint?token_id=${encodeURIComponent(tokenId)}`;
+  const res = await fetch(url);
+  if (!res.ok) return null;
+  const body = (await res.json()) as { mid?: string | number };
+  if (body?.mid === undefined || body?.mid === null) return null;
+  const n = Number(body.mid);
+  return Number.isFinite(n) ? n : null;
+}
+
+/**
+ * Удобная обёртка: midpoint нужной стороны (YES = Up, NO = Down) активного
+ * 5-минутного события. Используется при формировании лог-записи сигнала
+ * (см. issue #21).
+ */
+export async function fetchActiveMidpoint(
+  side: Side01,
+  nowMs: number = Date.now(),
+): Promise<number | null> {
+  const { yes, no } = await fetchActiveTokenIds(nowMs);
+  return fetchMidpoint(side === "YES" ? yes : no);
+}
+
+/**
+ * Форматирует midpoint в виде «47.30¢» для лога.
+ * Возвращает `"n/a"`, если цены нет (CLOB ещё не отдал стакан).
+ */
+export function formatMidpointCents(mid: number | null): string {
+  if (mid === null || !Number.isFinite(mid)) return "n/a";
+  return `${(mid * 100).toFixed(2)}¢`;
+}
+
+/**
+ * Лог-запись для сигнала по 4 прошедшим окнам + entry midpoint активного
+ * окна. Формат соответствует примеру из issue #21:
+ *
+ *   --- 4/29/2026, 4:25:05 PM ---
+ *   Trend: DOWN ×4 → Signal: BUY YES
+ *   Entry midpoint: 47.30¢
+ *   btc-updown-5m-1777479600 2026-04-29T16:20:00Z DOWN
+ *   btc-updown-5m-1777479300 2026-04-29T16:15:00Z DOWN
+ *   ...
+ */
+export function formatSignalLogEntry(
+  events: PastEvent[],
+  signal: Signal,
+  midpoint: number | null,
+  nowMs: number = Date.now(),
+): string {
+  const header = `--- ${new Date(nowMs).toLocaleString()} ---`;
+  const trendLine = `Trend: ${signal.trend} ×${signal.count} → Signal: BUY ${signal.side}`;
+  const midLine = `Entry midpoint: ${formatMidpointCents(midpoint)}`;
+  const eventLines = events.map((e) => `${e.slug} ${e.startTime} ${e.result ?? "null"}`);
+  return [header, trendLine, midLine, ...eventLines].join("\n");
+}
+
 if (require.main === module) {
-  // Без аргумента — берём активное (текущее) 5-минутное окно и возвращаем
-  // 4 события до него. С аргументом — поведение как раньше: 4 события до
-  // переданного слага.
+  // Без аргумента — берём активное (текущее) 5-минутное окно, возвращаем
+  // 4 события до него и, если все 4 разрешились в одну сторону, печатаем
+  // лог-запись сигнала с entry midpoint активного окна (issue #21).
+  // С аргументом-слагом — старое поведение: просто JSON 4 событий до слага.
   const slug = process.argv[2];
-  const events = slug ? getPastFiveMinuteEvents(slug) : getPastFiveMinuteEventsFromActive();
-  events
-    .then((evs) => {
-      console.log(JSON.stringify(evs, null, 2));
+  const run = slug
+    ? getPastFiveMinuteEvents(slug).then((evs) => JSON.stringify(evs, null, 2))
+    : (async () => {
+        const evs = await getPastFiveMinuteEventsFromActive();
+        const signal = computeSignal(evs);
+        if (!signal) return JSON.stringify(evs, null, 2);
+        const midpoint = await fetchActiveMidpoint(signal.side).catch(() => null);
+        return formatSignalLogEntry(evs, signal, midpoint);
+      })();
+  run
+    .then((out) => {
+      console.log(out);
     })
     .catch((e) => {
       console.error(e);
