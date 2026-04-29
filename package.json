@@ -6,7 +6,8 @@
   "scripts": {
     "build": "tsc",
     "start": "ts-node src/index.ts",
-    "buy": "ts-node src/buy.ts"
+    "buy": "ts-node src/buy.ts",
+    "past-events": "ts-node src/events.ts"
   },
   "dependencies": {
     "@polymarket/clob-client-v2": "^1.0.2",
