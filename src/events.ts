@@ -22,8 +22,19 @@
 //                    цены ["1","0"]/["0","1"].
 // До разрешения outcomePrices содержит текущие котировки рынка
 // (например `["0.955", "0.045"]`), такие события мы возвращаем как result=null.
+//
+// Дополнительно (см. issue #11): запрос `?slug=<slug>` на Gamma API имеет
+// агрессивный кэш и может на 1-7+ минут после `endDate` продолжать отдавать
+// промежуточные котировки и `closed=false`, тогда как UI Polymarket уже давно
+// показывает "Outcome: Up/Down". При этом запрос
+// `?series_slug=btc-up-or-down-5m&closed=true&order=startDate&ascending=false`
+// возвращает уже разрешённые события свежими (их `outcomePrices` ровно
+// `["1","0"]`/`["0","1"]`). Поэтому если slug-запрос показал событие как
+// неразрешённое, а его окно уже закончилось, мы добираем актуальные данные
+// из series-листинга и используем их.
 
 const SERIES_PREFIX = "btc-updown-5m";
+const SERIES_SLUG = "btc-up-or-down-5m";
 const STEP_SECONDS = 300; // 5 минут
 
 const GAMMA_HOST = process.env.GAMMA_HOST || "https://gamma-api.polymarket.com";
@@ -56,39 +67,22 @@ export function buildSlug(timestamp: number): string {
   return `${SERIES_PREFIX}-${timestamp}`;
 }
 
-async function fetchEventBySlug(slug: string): Promise<PastEvent> {
-  const url = `${GAMMA_HOST}/events?slug=${encodeURIComponent(slug)}`;
-  const res = await fetch(url);
-  if (!res.ok) {
-    throw new Error(`Gamma API ${res.status} ${res.statusText} for slug "${slug}"`);
-  }
-  const arr = (await res.json()) as any[];
-  if (!Array.isArray(arr) || arr.length === 0) {
-    throw new Error(`Event not found for slug "${slug}"`);
-  }
-  const event = arr[0];
-  const market = event.markets?.[0];
+/**
+ * Превращает один Gamma-event (как из `?slug=...`, так и из `?series_slug=...`)
+ * в наш `PastEvent`. Логика разрешения:
+ *   closed=true И outcomePrices ровно ["1","0"] / ["0","1"] (см. issue #9).
+ * До разрешения цены живые (например 0.955 / 0.045) — такие события возвращаем
+ * как result=null.
+ */
+function toPastEvent(event: any): PastEvent {
+  const market = event?.markets?.[0];
   if (!market) {
-    throw new Error(`Event "${slug}" has no markets`);
+    throw new Error(`Event "${event?.slug}" has no markets`);
   }
-
   // outcomes / outcomePrices приходят как JSON-строки внутри JSON.
   const outcomes: string[] = JSON.parse(market.outcomes);
   const prices: string[] = JSON.parse(market.outcomePrices);
 
-  // Признак "событие разрешено и можно достоверно сказать UP/DOWN":
-  // closed=true И в ценах ровно одна "1" (вторая "0"). До разрешения цены
-  // живые (например 0.955 / 0.045), поэтому сравниваем строго со строкой "1".
-  //
-  // Раньше дополнительно требовали `umaResolutionStatus === "resolved"`, но
-  // на 5-минутных рынках UMA подтверждает результат через десятки секунд (а
-  // иногда минут) после фактического закрытия — при этом и UI Polymarket, и
-  // outcomePrices уже показывают итог как ["1","0"]/["0","1"]. См. issue #9:
-  // запрос `btc-updown-5m-1777458000` возвращал result=null, хотя на сайте
-  // уже был "Outcome: Up". Финальные строки "1"/"0" в outcomePrices попадают
-  // только после расчёта рынка (во время торгов это всегда дробные строки,
-  // например "0.495" / "0.505"), поэтому пары closed=true + ["1","0"] /
-  // ["0","1"] достаточно, чтобы достоверно сказать UP/DOWN.
   const resolved =
     Boolean(event.closed) &&
     prices.filter((p) => p === "1").length === 1 &&
@@ -100,16 +94,54 @@ async function fetchEventBySlug(slug: string): Promise<PastEvent> {
     const winner = outcomes[winnerIdx];
     if (winner === "Up") result = "UP";
     else if (winner === "Down") result = "DOWN";
-    else throw new Error(`Unexpected winning outcome "${winner}" for slug "${slug}"`);
+    else throw new Error(`Unexpected winning outcome "${winner}" for slug "${event.slug}"`);
   }
 
   return {
-    slug,
-    startTimestamp: parseSlugTimestamp(slug),
+    slug: event.slug,
+    startTimestamp: parseSlugTimestamp(event.slug),
     startTime: market.eventStartTime ?? event.startDate,
     resolved,
     result,
   };
+}
+
+async function fetchEventBySlug(slug: string): Promise<PastEvent> {
+  const url = `${GAMMA_HOST}/events?slug=${encodeURIComponent(slug)}`;
+  const res = await fetch(url);
+  if (!res.ok) {
+    throw new Error(`Gamma API ${res.status} ${res.statusText} for slug "${slug}"`);
+  }
+  const arr = (await res.json()) as any[];
+  if (!Array.isArray(arr) || arr.length === 0) {
+    throw new Error(`Event not found for slug "${slug}"`);
+  }
+  return toPastEvent(arr[0]);
+}
+
+/**
+ * Берём последние `limit` уже разрешённых событий серии через `series_slug`.
+ * Этот эндпоинт, в отличие от `?slug=<slug>`, отдаёт свежие данные сразу после
+ * закрытия 5-минутного окна (см. issue #11): outcomePrices здесь уже
+ * `["1","0"]`/`["0","1"]` буквально через секунды после `endDate`, тогда как
+ * slug-запрос ещё несколько минут возвращает промежуточные котировки и
+ * `closed=false`. Используем как fallback для добора недостающих результатов.
+ */
+async function fetchRecentResolvedEvents(limit: number): Promise<PastEvent[]> {
+  const url =
+    `${GAMMA_HOST}/events?series_slug=${encodeURIComponent(SERIES_SLUG)}` +
+    `&closed=true&order=startDate&ascending=false&limit=${limit}`;
+  const res = await fetch(url);
+  if (!res.ok) {
+    throw new Error(`Gamma API ${res.status} ${res.statusText} for series "${SERIES_SLUG}"`);
+  }
+  const arr = (await res.json()) as any[];
+  if (!Array.isArray(arr)) return [];
+  // На странице могут попасться события из других подсерий — фильтруем по
+  // префиксу слага, чтобы не споткнуться при разборе timestamp-а.
+  return arr
+    .filter((e) => typeof e?.slug === "string" && e.slug.startsWith(`${SERIES_PREFIX}-`))
+    .map(toPastEvent);
 }
 
 /**
@@ -122,13 +154,28 @@ async function fetchEventBySlug(slug: string): Promise<PastEvent> {
  * старому (slug - 1200s). Для каждого события указано, разрешено ли оно
  * (`resolved`) и каков исход (`result`: "UP" | "DOWN" | null, если ещё нет).
  *
- * Запросы к Gamma API делаются параллельно (Promise.all) — 4 события за один
- * заход быстрее, чем последовательно, и порядок гарантирован Promise.all.
+ * Параллельно с пер-слаг-запросами тянем listing разрешённых событий серии
+ * через `?series_slug=...&closed=true` — он отдаёт свежие данные сразу после
+ * закрытия окна, тогда как `?slug=<slug>` залипает в кэше на минуты (issue
+ * #11). Если slug-запрос показал событие как ещё не разрешённое, но в
+ * series-listing-е оно уже разрешено, берём данные оттуда.
  */
 export async function getPastFiveMinuteEvents(slug: string): Promise<PastEvent[]> {
   const currentTs = parseSlugTimestamp(slug);
   const slugs = [1, 2, 3, 4].map((i) => buildSlug(currentTs - i * STEP_SECONDS));
-  return Promise.all(slugs.map(fetchEventBySlug));
+  const [perSlug, recentResolved] = await Promise.all([
+    Promise.all(slugs.map(fetchEventBySlug)),
+    fetchRecentResolvedEvents(20).catch(() => [] as PastEvent[]),
+  ]);
+  const resolvedByTs = new Map<number, PastEvent>();
+  for (const e of recentResolved) {
+    if (e.resolved) resolvedByTs.set(e.startTimestamp, e);
+  }
+  return perSlug.map((e) => {
+    if (e.resolved) return e;
+    const fresh = resolvedByTs.get(e.startTimestamp);
+    return fresh ?? e;
+  });
 }
 
 /**
