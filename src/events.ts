@@ -57,6 +57,20 @@
 // возвращает `{"mid":"0.473"}` — ровно середину между лучшим bid и лучшим ask
 // по нужному токену (YES = Up, NO = Down). Это и есть наш «entry midpoint»,
 // который мы пишем в лог рядом с сигналом.
+//
+// Запуск (issue #23): модуль работает как самостоятельный воркер на cron — каждые
+// 5 минут (`*/5 * * * *`, Europe/Moscow) считаем сигнал по последним 4 окнам
+// и, если все 4 разрешились в одну сторону, дописываем готовую запись в
+// `btc_signals.log` (рядом с корнем проекта) + пишем расширенный stdout-лог
+// каждого тика (живой воркер видно даже когда сигнала нет). Cron стартует
+// прямо на импорте модуля, как в локальном скрипте пользователя. Никакого
+// `require.main === module`: `ts-node src/events.ts` поднимает воркер,
+// а импорт хелперов (`getPastFiveMinuteEvents`, `computeSignal`, …) из тестов
+// тоже поднимает cron — это ожидаемо, тесты гасят его через `signalCronJob.stop()`.
+
+import { CronJob } from "cron";
+import * as fs from "fs";
+import * as path from "path";
 
 const SERIES_PREFIX = "btc-updown-5m";
 const SERIES_SLUG = "btc-up-or-down-5m";
@@ -483,27 +497,103 @@ export function formatSignalLogEntry(
   return [header, trendLine, midLine, ...eventLines].join("\n");
 }
 
-if (require.main === module) {
-  // Без аргумента — берём активное (текущее) 5-минутное окно, возвращаем
-  // 4 события до него и, если все 4 разрешились в одну сторону, печатаем
-  // лог-запись сигнала с entry midpoint активного окна (issue #21).
-  // С аргументом-слагом — старое поведение: просто JSON 4 событий до слага.
-  const slug = process.argv[2];
-  const run = slug
-    ? getPastFiveMinuteEvents(slug).then((evs) => JSON.stringify(evs, null, 2))
-    : (async () => {
-        const evs = await getPastFiveMinuteEventsFromActive();
-        const signal = computeSignal(evs);
-        if (!signal) return JSON.stringify(evs, null, 2);
-        const midpoint = await fetchActiveMidpoint(signal.side).catch(() => null);
-        return formatSignalLogEntry(evs, signal, midpoint);
-      })();
-  run
-    .then((out) => {
-      console.log(out);
-    })
-    .catch((e) => {
-      console.error(e);
-      process.exit(1);
-    });
+/**
+ * Куда дописываем сигнальный лог (issue #23). Файл лежит в корне проекта,
+ * рядом с `package.json`, чтобы его было удобно `tail -f`-ить и не путать с
+ * исходниками. Перенесли из локального скрипта пользователя как есть.
+ */
+export const LOG_PATH = path.resolve(__dirname, "..", "btc_signals.log");
+
+/**
+ * Дописывает готовую запись в `btc_signals.log`. Запись уже отформатирована
+ * (`formatSignalLogEntry`), здесь — только I/O и логирование результата.
+ *
+ * Любая ошибка ФС логируется, но не пробрасывается: один промах не должен
+ * валить cron — следующий тик через 5 минут попробует ещё раз.
+ */
+async function appendSignalLog(entry: string): Promise<void> {
+  // Один пустой перенос между записями + сама запись с переводом строки в конце.
+  const payload = `\n${entry}\n`;
+  try {
+    await fs.promises.appendFile(LOG_PATH, payload);
+    console.log(`[events] wrote signal log entry to ${LOG_PATH}`);
+  } catch (err) {
+    console.error(`[events] failed to append to ${LOG_PATH}:`, err);
+  }
 }
+
+/**
+ * Один тик cron-задачи (issue #23): проверяем последние 4 окна, и если они
+ * разрешились в одну сторону — собираем `formatSignalLogEntry` (с живым
+ * midpoint активного окна) и дописываем в лог. Иначе — просто пишем в stdout,
+ * что сигнала нет, чтобы по логам runtime было видно, что воркер живой и
+ * каждые 5 минут что-то делает.
+ *
+ * Экспортируется, чтобы можно было дёрнуть руками или из тестов, не дожидаясь
+ * cron-тика.
+ */
+export async function runSignalCheck(nowMs: number = Date.now()): Promise<void> {
+  const tickAt = new Date(nowMs).toISOString();
+  console.log(`[events] tick @ ${tickAt} — checking last 4 windows`);
+
+  let evs: PastEvent[];
+  try {
+    evs = await getPastFiveMinuteEventsFromActive(nowMs);
+  } catch (err) {
+    console.error(`[events] failed to load past events:`, err);
+    return;
+  }
+
+  // Дополнительное логирование (issue #23): печатаем «как есть» все 4 окна,
+  // чтобы по cron-логам было видно, что именно мы видели и почему сработал /
+  // не сработал сигнал.
+  for (const e of evs) {
+    console.log(`[events]   ${e.slug} ${e.startTime} ${e.result ?? "null"}`);
+  }
+
+  const signal = computeSignal(evs);
+  if (!signal) {
+    const unresolved = evs.filter((e) => !e.resolved).length;
+    console.log(
+      `[events] no signal: ${unresolved} unresolved, results=${evs
+        .map((e) => e.result ?? "null")
+        .join(",")}`,
+    );
+    return;
+  }
+
+  console.log(
+    `[events] signal: ${signal.trend} ×${signal.count} → BUY ${signal.side}`,
+  );
+  const midpoint = await fetchActiveMidpoint(signal.side, nowMs).catch((err) => {
+    console.error(`[events] midpoint fetch failed:`, err);
+    return null;
+  });
+  console.log(`[events] entry midpoint: ${formatMidpointCents(midpoint)}`);
+
+  const entry = formatSignalLogEntry(evs, signal, midpoint, nowMs);
+  console.log(entry);
+  await appendSignalLog(entry);
+}
+
+/**
+ * Cron-расписание из локального воркера пользователя (issue #23):
+ *   `*\/5 * * * *` в TZ Europe/Moscow — раз в 5 минут, в самом начале минуты,
+ * как раз когда стартует следующее 5-минутное окно серии.
+ *
+ * Создаётся всегда при импорте модуля (как и в исходном пользовательском
+ * скрипте), `start=true` — задача сразу включена.
+ */
+export const signalCronJob = new CronJob(
+  "*/5 * * * *",
+  () => {
+    runSignalCheck().catch((err) => console.error(`[events] tick failed:`, err));
+  },
+  null,
+  true,
+  "Europe/Moscow",
+);
+
+console.log(
+  `[events] cron started ('*/5 * * * *' Europe/Moscow), log path: ${LOG_PATH}`,
+);
