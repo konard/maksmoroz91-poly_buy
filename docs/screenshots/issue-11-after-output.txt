@@ -1,0 +1,30 @@
+[
+  {
+    "slug": "btc-updown-5m-1777460700",
+    "startTimestamp": 1777460700,
+    "startTime": "2026-04-29T11:05:00Z",
+    "resolved": true,
+    "result": "DOWN"
+  },
+  {
+    "slug": "btc-updown-5m-1777460400",
+    "startTimestamp": 1777460400,
+    "startTime": "2026-04-29T11:00:00Z",
+    "resolved": true,
+    "result": "UP"
+  },
+  {
+    "slug": "btc-updown-5m-1777460100",
+    "startTimestamp": 1777460100,
+    "startTime": "2026-04-29T10:55:00Z",
+    "resolved": true,
+    "result": "DOWN"
+  },
+  {
+    "slug": "btc-updown-5m-1777459800",
+    "startTimestamp": 1777459800,
+    "startTime": "2026-04-29T10:50:00Z",
+    "resolved": true,
+    "result": "DOWN"
+  }
+]
