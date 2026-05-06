@@ -4,11 +4,16 @@
 // Скрипт запускается в самом начале 5-минутного окна, когда YES и NO стоят
 // примерно по 50¢, поэтому лимит-цена жёстко 0.50.
 //
-// Хосты и WebSocket прописаны в коде. Из окружения берётся только
-// `PRIVATE_KEY` — приватный ключ EOA с USDC, которым подписываем ордер.
+// Хосты прописаны в коде. Из окружения берётся только `PRIVATE_KEY` —
+// приватный ключ EOA с USDC, которым подписываем ордер.
+//
+// Подписант — viem `WalletClient` (как в quickstart'е `@polymarket/clob-client-v2`,
+// см. README пакета). Ethers v5 Wallet тоже технически принимается типом
+// `ClobSigner`, но документированный путь — viem, поэтому используем его.
 
 import { ClobClient, Side, OrderType } from "@polymarket/clob-client-v2";
-import { Wallet } from "@ethersproject/wallet";
+import { createWalletClient, defineChain, http } from "viem";
+import { privateKeyToAccount } from "viem/accounts";
 import "dotenv/config";
 
 const CLOB_HOST = "https://clob.polymarket.com";
@@ -19,6 +24,20 @@ const STEP_SECONDS = 300;
 const LIMIT_PRICE = 0.5;
 const TICK_SIZE = "0.01" as const;
 
+// Минимальное определение Polygon-mainnet'а для viem `WalletClient`.
+// Используем `defineChain` вместо `import { polygon } from "viem/chains"`,
+// потому что `viem/chains` тянет дополнительные определения (включая
+// `tempo`-чейн), у которых TypeScript не может без ошибок проверить типы
+// `ox/tempo/*.ts` под Node10-резолвом этого проекта. Здесь нам всё равно
+// нужны только `id` и `name` — никаких RPC-вызовов мы не делаем, всё подписание
+// идёт оффлайн через `signTypedData`.
+const polygon = defineChain({
+  id: 137,
+  name: "Polygon",
+  nativeCurrency: { name: "POL", symbol: "POL", decimals: 18 },
+  rpcUrls: { default: { http: ["https://polygon-rpc.com"] } },
+});
+
 export type Side01 = "YES" | "NO";
 
 let clientPromise: Promise<ClobClient> | null = null;
@@ -26,7 +45,16 @@ let clientPromise: Promise<ClobClient> | null = null;
 function getClient(): Promise<ClobClient> {
   if (!clientPromise) {
     clientPromise = (async () => {
-      const signer = new Wallet(process.env.PRIVATE_KEY as string);
+      const account = privateKeyToAccount(
+        process.env.PRIVATE_KEY as `0x${string}`,
+      );
+      // viem требует chain в WalletClient'е, иначе `http()` без явного URL
+      // не знает к чему подключаться. Polymarket = Polygon mainnet (137).
+      const signer = createWalletClient({
+        account,
+        chain: polygon,
+        transport: http(),
+      });
       const bootstrap = new ClobClient({ host: CLOB_HOST, chain: CHAIN_ID, signer });
       const creds = await bootstrap.createOrDeriveApiKey();
       return new ClobClient({
